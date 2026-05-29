@@ -1,0 +1,20 @@
+target/
+.claude/
+.playwright-mcp/
+# Playwright screenshots sometimes land at the project root
+map-zoom-*.png
+ic-locations.png
+node_modules/
+package-lock.json
+package.json
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+src/main/frontend/generated/
+src/main/bundles/
+.vaadin/
+vite.generated.ts
+tsconfig.json
+types.d.ts
