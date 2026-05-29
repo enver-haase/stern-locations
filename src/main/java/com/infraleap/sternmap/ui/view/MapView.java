@@ -7,6 +7,14 @@ import com.infraleap.sternmap.ui.MapExtentFilter;
 import com.infraleap.sternmap.ui.MapIcons;
 import com.vaadin.flow.component.AttachEvent;
 import com.vaadin.flow.component.Component;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.clipboard.Clipboard;
+import com.vaadin.flow.component.geolocation.Geolocation;
+import com.vaadin.flow.component.geolocation.GeolocationError;
+import com.vaadin.flow.component.geolocation.GeolocationErrorCode;
+import com.vaadin.flow.component.geolocation.GeolocationOptions;
+import com.vaadin.flow.component.geolocation.GeolocationPosition;
 import com.vaadin.flow.component.html.Anchor;
 import com.vaadin.flow.component.html.Div;
 import com.vaadin.flow.component.html.H1;
@@ -15,6 +23,8 @@ import com.vaadin.flow.component.html.ListItem;
 import com.vaadin.flow.component.html.Paragraph;
 import com.vaadin.flow.component.html.Span;
 import com.vaadin.flow.component.html.UnorderedList;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
 import com.vaadin.flow.component.map.Map;
 import com.vaadin.flow.component.map.configuration.Coordinate;
 import com.vaadin.flow.component.map.configuration.Extent;
@@ -28,6 +38,7 @@ import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.router.PageTitle;
 import com.vaadin.flow.router.Route;
 
+import java.time.Duration;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -125,16 +136,12 @@ public class MapView extends HorizontalLayout {
     @Override
     protected void onAttach(AttachEvent attachEvent) {
         super.onAttach(attachEvent);
-        attachEvent.getUI().getPage()
-                .executeJs("return new Promise((resolve) => {"
-                        + "  if (!navigator.geolocation) { resolve(''); return; }"
-                        + "  navigator.geolocation.getCurrentPosition("
-                        + "    p => resolve(p.coords.latitude + ',' + p.coords.longitude),"
-                        + "    e => resolve('err:' + e.code + ':' + e.message),"
-                        + "    {enableHighAccuracy: true, timeout: 10000, maximumAge: 60000}"
-                        + "  );"
-                        + "})")
-                .then(String.class, this::onLocation);
+        GeolocationOptions options = GeolocationOptions.builder()
+                .highAccuracy(true)
+                .timeout(Duration.ofSeconds(10))
+                .maximumAge(Duration.ofMinutes(1))
+                .build();
+        Geolocation.getPosition(this::onPosition, this::onLocationError, options);
 
         // Install zoom-aware icon scaling on the client. OpenLayers (the engine
         // underneath Vaadin Map) keeps icons at constant pixel size regardless
@@ -199,29 +206,9 @@ public class MapView extends HorizontalLayout {
             + "  tryInstall();"
             + "})();";
 
-    private void onLocation(String result) {
-        if (result == null || result.isBlank()) {
-            statusLine.setText("Geolocation unavailable in this browser. Showing the world.");
-            Notification.show("Geolocation not available", 5000, Notification.Position.TOP_END)
-                    .addThemeVariants(NotificationVariant.LUMO_WARNING);
-            loadVenuesAndRenderMarkers();
-            return;
-        }
-        if (result.startsWith("err:")) {
-            statusLine.setText("Couldn't get your location — showing the world.");
-            Notification.show("Couldn't get your location: " + result.substring(4),
-                            6000, Notification.Position.TOP_END)
-                    .addThemeVariants(NotificationVariant.LUMO_ERROR);
-            loadVenuesAndRenderMarkers();
-            return;
-        }
-        String[] parts = result.split(",");
-        if (parts.length != 2) {
-            statusLine.setText("Bad geolocation payload: " + result);
-            return;
-        }
-        userLat = Double.parseDouble(parts[0]);
-        userLon = Double.parseDouble(parts[1]);
+    private void onPosition(GeolocationPosition position) {
+        userLat = position.coords().latitude();
+        userLon = position.coords().longitude();
 
         MarkerFeature you = new MarkerFeature(new Coordinate(userLon, userLat), MapIcons.youMarker());
         you.setText("You");
@@ -230,6 +217,22 @@ public class MapView extends HorizontalLayout {
         map.setCenter(new Coordinate(userLon, userLat));
         map.setZoom(11);
 
+        loadVenuesAndRenderMarkers();
+    }
+
+    private void onLocationError(GeolocationError error) {
+        GeolocationErrorCode code = error.errorCode();
+        String human = switch (code) {
+            case PERMISSION_DENIED -> "Location permission denied";
+            case POSITION_UNAVAILABLE -> "Location unavailable";
+            case TIMEOUT -> "Location request timed out";
+            case UNKNOWN -> "Geolocation not available";
+        };
+        statusLine.setText(human + " — showing the world.");
+        NotificationVariant variant = code == GeolocationErrorCode.PERMISSION_DENIED
+                ? NotificationVariant.LUMO_WARNING
+                : NotificationVariant.LUMO_ERROR;
+        Notification.show(human, 5000, Notification.Position.TOP_END).addThemeVariants(variant);
         loadVenuesAndRenderMarkers();
     }
 
@@ -386,9 +389,14 @@ public class MapView extends HorizontalLayout {
         card.add(metaRow);
 
         if (v.address() != null && !v.address().isBlank()) {
-            Paragraph addr = new Paragraph(v.address());
-            addr.getStyle().set("margin", "0.15rem 0").set("font-size", "0.8rem");
-            card.add(addr);
+            Span addrText = new Span(v.address());
+            addrText.getStyle().set("font-size", "0.8rem").set("flex", "1");
+            HorizontalLayout addrRow = new HorizontalLayout(addrText, copyButton(v.address(), "Copy address"));
+            addrRow.setSpacing(false);
+            addrRow.setPadding(false);
+            addrRow.setAlignItems(com.vaadin.flow.component.orderedlayout.FlexComponent.Alignment.CENTER);
+            addrRow.getStyle().set("gap", "0.25rem").set("margin", "0.15rem 0");
+            card.add(addrRow);
         }
 
         if (v.machines() != null && !v.machines().isEmpty()) {
@@ -404,9 +412,13 @@ public class MapView extends HorizontalLayout {
         if (v.websiteUrl() != null && !v.websiteUrl().isBlank()) {
             Anchor link = new Anchor(v.websiteUrl(), "Website ↗");
             link.setTarget("_blank");
-            link.getStyle().set("display", "block").set("margin-top", "0.25rem")
-                    .set("font-size", "0.75rem");
-            card.add(link);
+            link.getStyle().set("font-size", "0.75rem").set("flex", "1");
+            HorizontalLayout webRow = new HorizontalLayout(link, copyButton(v.websiteUrl(), "Copy URL"));
+            webRow.setSpacing(false);
+            webRow.setPadding(false);
+            webRow.setAlignItems(com.vaadin.flow.component.orderedlayout.FlexComponent.Alignment.CENTER);
+            webRow.getStyle().set("gap", "0.25rem").set("margin-top", "0.25rem");
+            card.add(webRow);
         }
 
         card.getElement().addEventListener("click", e -> {
@@ -416,6 +428,25 @@ public class MapView extends HorizontalLayout {
         });
 
         return card;
+    }
+
+    /**
+     * Small tertiary-inline button with the two-rectangle COPY icon that writes
+     * {@code text} to the system clipboard on click via the Vaadin 25.2
+     * {@link Clipboard} API. Click is stopped from bubbling to the card so the
+     * map doesn't re-center.
+     */
+    private Button copyButton(String text, String tooltip) {
+        Button btn = new Button(new Icon(VaadinIcon.COPY));
+        btn.addThemeVariants(ButtonVariant.LUMO_TERTIARY_INLINE, ButtonVariant.LUMO_SMALL);
+        btn.setTooltipText(tooltip);
+        btn.getStyle().set("padding", "0").set("min-width", "auto").set("flex-shrink", "0");
+        btn.getElement().getStyle().set("--lumo-icon-size-m", "0.95rem");
+        Clipboard.onClick(btn).writeText(text);
+        btn.addClickListener(e ->
+                Notification.show("Copied", 1200, Notification.Position.BOTTOM_CENTER));
+        btn.getElement().addEventListener("click", e -> {}).stopPropagation();
+        return btn;
     }
 
     /**
