@@ -11,6 +11,8 @@ import com.infraleap.sternmap.stern.domain.SternVenueV2;
 import com.infraleap.sternmap.stern.domain.VenueOnMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import jakarta.annotation.PostConstruct;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -143,6 +145,25 @@ public class SternVenueCacheService {
                 .build();
     }
 
+    /**
+     * Eager cache warm at bean-init time. {@code @PostConstruct} runs during
+     * {@code finishBeanFactoryInitialization()}, which is BEFORE the
+     * {@code SmartLifecycle} that starts the embedded web server — so by the
+     * time Tomcat accepts the first connection, the cache is already populated.
+     * Auth failures don't fail bean init: we log and let the app start with an
+     * empty cache (rather than refusing to boot on a transient Stern outage).
+     */
+    @PostConstruct
+    void warmAtStartup() {
+        try {
+            log.info("Pre-warming venue cache at startup (before Tomcat accepts connections)");
+            authService.login();
+            ensureLoaded();
+        } catch (Exception e) {
+            log.error("Startup cache warm failed — app will start with empty cache: {}", e.toString());
+        }
+    }
+
     public List<VenueOnMap> getAllVenues() {
         ensureLoaded();
         return cache.get();
@@ -162,58 +183,105 @@ public class SternVenueCacheService {
         if (loaded) return;
         synchronized (loadLock) {
             if (loaded) return;
-            Instant overallStart = Instant.now();
-
-            // Step 1: load Stern IC + Stern Army in parallel.
-            CompletableFuture<List<SternVenueV2>> icFuture =
-                    CompletableFuture.supplyAsync(this::loadAllSternIc);
-            CompletableFuture<List<PinballMapVenue>> armyFuture =
-                    CompletableFuture.supplyAsync(this::loadAllSternArmyByRegion);
-
-            List<SternVenueV2> ic;
-            List<PinballMapVenue> army;
-            try {
-                ic = icFuture.get();
-                army = armyFuture.get();
-            } catch (Exception e) {
-                log.error("Cache load failed: {}", e.toString());
-                loaded = true;
-                return;
-            }
-            sternIcCount = ic.size();
-            sternArmyCount = army.size();
-
-            // Step 2: convert + cross-flag the per-region results.
-            Set<Long> perRegionIds = new HashSet<>();
-            for (PinballMapVenue a : army) perRegionIds.add(a.id());
-            List<VenueOnMap> merged = mergeAndCrossFlag(ic, army);
-
-            // Step 3: supplementary sweep — Pinball Map's per-region API misses
-            // any country that isn't a named region (notably Germany, France,
-            // Italy, Netherlands, Belgium, Sweden, Norway, etc.). Bucket the
-            // unflagged Stern IC venues into 1° cells, query Pinball Map at the
-            // densest cells' centroids, and cross-flag any is_stern_army venues
-            // we find. Unmatched additions get appended as standalone entries,
-            // and the global Stern Army count reflects both sweeps together.
-            SupplementaryResult supp = supplementaryCrossFlagSweep(merged, perRegionIds);
-            crossFlaggedCount += supp.newCrossFlags();
-            // sternArmyCount = total unique Stern Army venues we know about,
-            // whether cross-flagged on an IC venue or standalone. Adds BOTH
-            // the new cross-flags AND the new standalone venues discovered by
-            // the supplementary sweep (per-region's contributions are already
-            // counted by the initial `army.size()`).
-            sternArmyCount += supp.newCrossFlags() + supp.unmatched().size();
-            for (PinballMapVenue av : supp.unmatched()) merged.add(toVenue(av));
-
-            merged.sort(Comparator.comparing(VenueOnMap::name, String.CASE_INSENSITIVE_ORDER));
-
-            cache.set(merged);
+            doLoad();
+            // Flip `loaded` even if doLoad() failed — readers then short-circuit
+            // and see an empty list rather than spinning a fresh REST sweep on
+            // every page hit.
             loaded = true;
-            log.info("Venue cache loaded in {} ms — {} Stern IC + {} Stern Army "
-                            + "({} cross-flagged on IC venues) = {} total entries",
-                    Duration.between(overallStart, Instant.now()).toMillis(),
-                    sternIcCount, sternArmyCount, crossFlaggedCount, merged.size());
         }
+    }
+
+    /**
+     * Re-runs the full load and atomically swaps the published cache. Triggered
+     * on a fixed interval (see {@link #scheduledRefresh()}). Concurrent readers
+     * via {@link #getAllVenues()} keep seeing the previous list until the new
+     * one is published; if the refresh fails, the previous list is preserved.
+     */
+    public void refresh() {
+        synchronized (loadLock) {
+            doLoad();
+            loaded = true;
+        }
+    }
+
+    /**
+     * Spring-scheduled background refresh. {@code fixedDelay} means the next
+     * run starts 6 h after the previous one finishes, so a slow load won't
+     * pile up overlapping refreshes; {@code initialDelay} skips the first
+     * scheduled tick because {@link SternSmokeTest} already warms the cache
+     * at startup.
+     */
+    @Scheduled(initialDelayString = "PT6H", fixedDelayString = "PT6H")
+    public void scheduledRefresh() {
+        log.info("Scheduled venue cache refresh starting");
+        try {
+            refresh();
+        } catch (Exception e) {
+            log.error("Scheduled refresh failed: {}", e.toString());
+        }
+    }
+
+    /**
+     * Loads the full cache and atomically publishes it. On failure, the previous
+     * published list and stats are left untouched — for the initial load that
+     * means readers see an empty list; for the periodic refresh that means
+     * readers keep seeing the last-known-good list.
+     */
+    private void doLoad() {
+        Instant overallStart = Instant.now();
+
+        // Step 1: load Stern IC + Stern Army in parallel.
+        CompletableFuture<List<SternVenueV2>> icFuture =
+                CompletableFuture.supplyAsync(this::loadAllSternIc);
+        CompletableFuture<List<PinballMapVenue>> armyFuture =
+                CompletableFuture.supplyAsync(this::loadAllSternArmyByRegion);
+
+        List<SternVenueV2> ic;
+        List<PinballMapVenue> army;
+        try {
+            ic = icFuture.get();
+            army = armyFuture.get();
+        } catch (Exception e) {
+            log.error("Cache load failed: {}", e.toString());
+            return;
+        }
+
+        // Step 2: convert + cross-flag the per-region results.
+        Set<Long> perRegionIds = new HashSet<>();
+        for (PinballMapVenue a : army) perRegionIds.add(a.id());
+        MergeResult mr = mergeAndCrossFlag(ic, army);
+        List<VenueOnMap> merged = mr.venues();
+        int newCrossFlagged = mr.crossFlagged();
+
+        // Step 3: supplementary sweep — Pinball Map's per-region API misses
+        // any country that isn't a named region (notably Germany, France,
+        // Italy, Netherlands, Belgium, Sweden, Norway, etc.). Bucket the
+        // unflagged Stern IC venues into 1° cells, query Pinball Map at the
+        // densest cells' centroids, and cross-flag any is_stern_army venues
+        // we find. Unmatched additions get appended as standalone entries,
+        // and the global Stern Army count reflects both sweeps together.
+        SupplementaryResult supp = supplementaryCrossFlagSweep(merged, perRegionIds);
+        newCrossFlagged += supp.newCrossFlags();
+        // sternArmyCount = total unique Stern Army venues we know about,
+        // whether cross-flagged on an IC venue or standalone. Adds BOTH
+        // the new cross-flags AND the new standalone venues discovered by
+        // the supplementary sweep (per-region's contributions are already
+        // counted by the initial `army.size()`).
+        int newArmyCount = army.size() + supp.newCrossFlags() + supp.unmatched().size();
+        for (PinballMapVenue av : supp.unmatched()) merged.add(toVenue(av));
+
+        merged.sort(Comparator.comparing(VenueOnMap::name, String.CASE_INSENSITIVE_ORDER));
+
+        // Publish atomically: cache.set() is the happens-before fence for
+        // readers via getAllVenues(); the volatile counters follow it.
+        cache.set(merged);
+        sternIcCount = ic.size();
+        sternArmyCount = newArmyCount;
+        crossFlaggedCount = newCrossFlagged;
+        log.info("Venue cache loaded in {} ms — {} Stern IC + {} Stern Army "
+                        + "({} cross-flagged on IC venues) = {} total entries",
+                Duration.between(overallStart, Instant.now()).toMillis(),
+                sternIcCount, sternArmyCount, crossFlaggedCount, merged.size());
     }
 
     // ---- Stern IC global (Stern v2 REST) ----
@@ -326,7 +394,10 @@ public class SternVenueCacheService {
 
     // ---- Merge + cross-flag ----
 
-    private List<VenueOnMap> mergeAndCrossFlag(List<SternVenueV2> ic, List<PinballMapVenue> army) {
+    /** Result of the initial merge — the merged list and how many IC venues were cross-flagged with Stern Army. */
+    private record MergeResult(List<VenueOnMap> venues, int crossFlagged) {}
+
+    private MergeResult mergeAndCrossFlag(List<SternVenueV2> ic, List<PinballMapVenue> army) {
         List<VenueOnMap> icMerged = new ArrayList<>(ic.size());
         for (SternVenueV2 v : ic) icMerged.add(toVenue(v));
 
@@ -341,7 +412,6 @@ public class SternVenueCacheService {
                 crossed++;
             }
         }
-        crossFlaggedCount = crossed;
 
         // Append Stern Army venues that didn't match any Stern IC venue
         List<VenueOnMap> standaloneArmy = army.stream()
@@ -353,7 +423,7 @@ public class SternVenueCacheService {
         all.addAll(icMerged);
         all.addAll(standaloneArmy);
         all.sort(Comparator.comparing(VenueOnMap::name, String.CASE_INSENSITIVE_ORDER));
-        return all;
+        return new MergeResult(all, crossed);
     }
 
     private static int findClosestIcIndex(List<VenueOnMap> ic, double lat, double lon, double maxDeg) {

@@ -11,6 +11,8 @@ import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
 import com.vaadin.flow.component.clipboard.Clipboard;
 import com.vaadin.flow.component.geolocation.Geolocation;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.grid.GridVariant;
 import com.vaadin.flow.component.geolocation.GeolocationError;
 import com.vaadin.flow.component.geolocation.GeolocationErrorCode;
 import com.vaadin.flow.component.geolocation.GeolocationOptions;
@@ -33,8 +35,8 @@ import com.vaadin.flow.component.map.configuration.feature.MarkerFeature;
 import com.vaadin.flow.component.notification.Notification;
 import com.vaadin.flow.component.notification.NotificationVariant;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
-import com.vaadin.flow.component.orderedlayout.Scroller;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.data.renderer.ComponentRenderer;
 import com.vaadin.flow.router.PageTitle;
 import com.vaadin.flow.router.Route;
 
@@ -47,23 +49,22 @@ import java.util.List;
 @PageTitle("Stern Pinball Near Me")
 public class MapView extends HorizontalLayout {
 
-    /** How many nearest venues to list in the sidebar before the user has interacted with the map. */
-    private static final int INITIAL_SIDEBAR_LIMIT = 25;
-
     private final SternVenueCacheService cache;
     private final MachineHighScoreService highScoreService;
 
     private final Map map = new Map();
     private final VerticalLayout sidebar = new VerticalLayout();
     private final Div statusLine = new Div();
-    private final VerticalLayout list = new VerticalLayout();
+    /**
+     * Sidebar Grid. Holds all venues sorted by distance; only the ~20 visible
+     * rows are materialised as Vaadin components at any time (Grid's
+     * client-side row virtualisation), so the previous "build 4797 cards"
+     * cost is gone — cards are constructed lazily as the user scrolls.
+     */
+    private final Grid<VenueOnMap> grid = new Grid<>();
 
-    /** Marker → sidebar card (when the card exists). Click on the map highlights the card. */
-    private final java.util.Map<Feature, Component> markerToCard = new IdentityHashMap<>();
-    /** Per-venue card so we can re-show them when re-filtering by extent. */
-    private final java.util.Map<Long, Component> venueIdToCard = new java.util.HashMap<>();
+    /** Feature → venue. Used to recover the venue when the user clicks a marker. */
     private final java.util.Map<Feature, VenueOnMap> markerToVenue = new IdentityHashMap<>();
-    private Component selectedCard;
     private List<VenueOnMap> allVenues = List.of();
     private double userLat, userLon;
 
@@ -96,37 +97,54 @@ public class MapView extends HorizontalLayout {
         statusLine.getStyle().set("font-size", "0.875rem")
                 .set("color", "var(--vaadin-text-color-secondary, #666)");
 
-        list.setPadding(false);
-        list.setSpacing(false);
-        list.setWidthFull();
-        Scroller scroller = new Scroller(list);
-        scroller.setSizeFull();
-        scroller.getStyle().set("margin-top", "0.75rem");
+        // The Grid is the sidebar's scrollable content. One ComponentRenderer
+        // column, no header, single-row selection. Grid's client-side row
+        // virtualisation means buildCard() only runs for the ~20 rows visible
+        // in the viewport at any moment — scrolling materialises more on
+        // demand, so showing all 4797 entries costs no more up front than
+        // showing 25 did before.
+        grid.addColumn(new ComponentRenderer<>(this::buildCard))
+                .setHeader((String) null)
+                .setFlexGrow(1);
+        grid.setSelectionMode(Grid.SelectionMode.SINGLE);
+        grid.addThemeVariants(GridVariant.LUMO_NO_BORDER, GridVariant.LUMO_NO_ROW_BORDERS, GridVariant.LUMO_COMPACT);
+        grid.setSizeFull();
+        grid.getStyle().set("margin-top", "0.75rem");
+        grid.addSelectionListener(event -> event.getFirstSelectedItem().ifPresent(v -> {
+            // Selecting a row pans + zooms the map to the venue. Triggered
+            // both by user click on a row and programmatically when a map
+            // marker is clicked (see addFeatureClickListener below) — the
+            // selectionListener handles both paths identically.
+            map.setCenter(new Coordinate(v.lon(), v.lat()));
+            map.setZoom(Math.max(map.getZoom(), 14));
+        }));
 
-        sidebar.add(title, sub, statusLine, scroller);
-        sidebar.expand(scroller);
+        sidebar.add(title, sub, statusLine, grid);
+        sidebar.expand(grid);
 
         map.setSizeFull();
         map.setCenter(new Coordinate(10.0, 50.0));
         map.setZoom(3);
 
         map.addFeatureClickListener(event -> {
-            Component card = markerToCard.get(event.getFeature());
-            if (card != null) {
-                selectCard(card);
-            } else if (event.getFeature() instanceof MarkerFeature m) {
-                // Marker that wasn't currently in the sidebar — pop in just that venue
+            if (event.getFeature() instanceof MarkerFeature m) {
                 VenueOnMap v = markerToVenue.get(event.getFeature());
                 if (v != null) {
-                    renderSidebar(List.of(v));
-                    Component c = venueIdToCard.get(v.id());
-                    if (c != null) selectCard(c);
+                    // Select + scroll-to: scrollToItem positions the row in
+                    // the visible viewport, and select() highlights it. The
+                    // selection listener then takes care of recentering the
+                    // map on the venue.
+                    grid.select(v);
+                    grid.scrollToItem(v);
+                } else {
+                    // Defensive: marker with no associated venue (e.g. the
+                    // "You" marker). Just recenter without touching the grid.
+                    map.setCenter(m.getCoordinates());
                 }
-                map.setCenter(m.getCoordinates());
             }
         });
 
-        map.addViewMoveEndListener(event -> filterSidebarToExtent(event.getExtent()));
+        map.addViewMoveEndListener(event -> updateInViewStatus(event.getExtent()));
 
         add(sidebar, map);
         setFlexGrow(0, sidebar);
@@ -237,13 +255,10 @@ public class MapView extends HorizontalLayout {
     }
 
     private void loadVenuesAndRenderMarkers() {
+        long t0 = System.nanoTime();
         statusLine.setText("Loading global Stern IC + global Stern Army (per-region REST sweep)…");
         allVenues = cache.warm();
-        statusLine.setText(allVenues.size() + " venues loaded — "
-                + cache.getSternIcCount() + " Stern IC + "
-                + cache.getSternArmyCount() + " Stern Army global ("
-                + cache.getCrossFlaggedCount() + " cross-flagged on IC venues). "
-                + "Pan/zoom to filter.");
+        long tWarm = System.nanoTime();
 
         for (VenueOnMap v : allVenues) {
             // Three marker variants:
@@ -259,78 +274,73 @@ public class MapView extends HorizontalLayout {
             map.getFeatureLayer().addFeature(marker);
             markerToVenue.put(marker, v);
         }
+        long tMarkers = System.nanoTime();
 
-        // Initial sidebar: nearest INITIAL_SIDEBAR_LIMIT venues if we have a GPS fix,
-        // else just the first N alphabetically.
-        List<VenueOnMap> initial;
-        if (userLat != 0 || userLon != 0) {
-            initial = allVenues.stream()
+        // Populate the Grid with every venue, sorted by distance to the user
+        // (or alphabetically when we don't yet have a GPS fix). Grid's row
+        // virtualisation means we hand it 4797 items but only the visible
+        // ~20 become Vaadin components — buildCard() runs lazily as the user
+        // scrolls. The sort is stable for the lifetime of the view.
+        List<VenueOnMap> ordered = (userLat != 0 || userLon != 0)
+                ? allVenues.stream()
                     .sorted(Comparator.comparingDouble(v -> haversineKm(userLat, userLon, v.lat(), v.lon())))
-                    .limit(INITIAL_SIDEBAR_LIMIT)
+                    .toList()
+                : allVenues.stream()
+                    .sorted(Comparator.comparing(VenueOnMap::name, String.CASE_INSENSITIVE_ORDER))
                     .toList();
-        } else {
-            initial = allVenues.stream().limit(INITIAL_SIDEBAR_LIMIT).toList();
-        }
-        renderSidebar(initial);
+        grid.setItems(ordered);
+        long tDone = System.nanoTime();
+
+        statusLine.setText(allVenues.size() + " venues — "
+                + cache.getSternIcCount() + " Stern IC + "
+                + cache.getSternArmyCount() + " Stern Army ("
+                + cache.getCrossFlaggedCount() + " cross-flagged). "
+                + "Click a marker to scroll the list to it.");
+
+        System.out.printf(
+                "[PERF] load: cache.warm() %.1f ms, %d markers %.1f ms, grid.setItems(%d) %.1f ms — total %.1f ms%n",
+                (tWarm - t0) / 1_000_000.0,
+                allVenues.size(), (tMarkers - tWarm) / 1_000_000.0,
+                ordered.size(), (tDone - tMarkers) / 1_000_000.0,
+                (tDone - t0) / 1_000_000.0);
     }
 
     /**
-     * Vaadin Map reports the Extent in the user projection (EPSG:4326 by
-     * default — lon/lat degrees), not the internal Web Mercator. We treat
-     * minX/maxX as longitudes and minY/maxY as latitudes directly. The actual
-     * inclusion logic lives in {@link MapExtentFilter} so it can be unit
-     * tested.
+     * Status-line-only reaction to pan/zoom. The Grid contents are fixed once
+     * loaded (all venues, sorted by distance), so the extent listener no
+     * longer drives sidebar rendering. We still report "X of N in view" for
+     * the user, and keep the extent value dump in the `[PERF]` line so the
+     * earlier "0 of N in view" bug at certain zoom levels can be diagnosed
+     * from real values. {@link MapExtentFilter} is unit-tested for the
+     * EPSG:4326-degrees contract.
      */
-    private void filterSidebarToExtent(Extent extent) {
+    private void updateInViewStatus(Extent extent) {
         if (extent == null) return;
+        long t0 = System.nanoTime();
         List<VenueOnMap> inView = MapExtentFilter.venuesInExtent(extent, allVenues);
-        inView.sort(Comparator.comparingDouble(v -> haversineKm(userLat, userLon, v.lat(), v.lon())));
-        renderSidebar(inView);
+        long tFilter = System.nanoTime();
         long armyInView = inView.stream().filter(VenueOnMap::isSternArmy).count();
         statusLine.setText(inView.size() + " of " + allVenues.size()
                 + " in view — " + cache.getSternIcCount() + " Stern IC + "
                 + cache.getSternArmyCount() + " Stern Army globally ("
                 + armyInView + " Stern Army in view, " + cache.getCrossFlaggedCount()
                 + " cross-flagged on IC venues).");
-    }
-
-    // ---- Sidebar rendering ----
-
-    private void renderSidebar(List<VenueOnMap> venues) {
-        list.removeAll();
-        markerToCard.clear();
-        venueIdToCard.clear();
-        selectedCard = null;
-        if (venues.isEmpty()) {
-            Div empty = new Div();
-            empty.setText("No venues in this view. Zoom out to see more.");
-            empty.getStyle().set("padding", "0.75rem")
-                    .set("color", "var(--vaadin-text-color-secondary, #888)")
-                    .set("font-style", "italic");
-            list.add(empty);
-            return;
-        }
-        for (VenueOnMap v : venues) {
-            Component card = buildCard(v);
-            venueIdToCard.put(v.id(), card);
-            // Map every venue marker back to this card so map clicks work
-            markerToVenue.forEach((feature, venue) -> {
-                if (venue.id() == v.id() && venue.sources().equals(v.sources())) {
-                    markerToCard.put(feature, card);
-                }
-            });
-            list.add(card);
-        }
+        long tDone = System.nanoTime();
+        System.out.printf(
+                "[PERF] viewMoveEnd: %d/%d in view — extent [lon %.3f..%.3f, lat %.3f..%.3f] zoom %.2f — filter %.1f ms, total %.1f ms%n",
+                inView.size(), allVenues.size(),
+                extent.getMinX(), extent.getMaxX(), extent.getMinY(), extent.getMaxY(),
+                map.getZoom(),
+                (tFilter - t0) / 1_000_000.0,
+                (tDone - t0) / 1_000_000.0);
     }
 
     private Component buildCard(VenueOnMap v) {
+        // Card chrome (border, selected-state styling) is handled by the Grid
+        // row, not this Div — keep this lean so the ComponentRenderer can
+        // materialise rows quickly as the user scrolls.
         Div card = new Div();
-        card.getStyle()
-                .set("padding", "0.75rem")
-                .set("border-bottom", "1px solid var(--vaadin-border-color, #e5e5e5)")
-                .set("border-left", "4px solid transparent")
-                .set("cursor", "pointer")
-                .set("transition", "background 120ms, border-left-color 120ms");
+        card.getStyle().set("padding", "0.25rem 0").set("width", "100%");
 
         H4 name = new H4(v.name());
         name.getStyle().set("margin", "0 0 0.2rem 0").set("font-size", "1rem");
@@ -421,12 +431,10 @@ public class MapView extends HorizontalLayout {
             card.add(webRow);
         }
 
-        card.getElement().addEventListener("click", e -> {
-            selectCard(card);
-            map.setCenter(new Coordinate(v.lon(), v.lat()));
-            map.setZoom(Math.max(map.getZoom(), 14));
-        });
-
+        // No per-card click handler: the enclosing Grid row's selection
+        // listener (set up in the constructor) handles row clicks and pans
+        // the map. Click-to-select-row also fires when a marker click calls
+        // grid.select(v), so both paths converge on a single listener.
         return card;
     }
 
@@ -529,20 +537,6 @@ public class MapView extends HorizontalLayout {
             list.add(row);
         }
         container.add(list);
-    }
-
-    private void selectCard(Component card) {
-        if (selectedCard != null && selectedCard != card) {
-            selectedCard.getElement().getStyle()
-                    .set("background", "")
-                    .set("border-left-color", "transparent");
-        }
-        card.getElement().getStyle()
-                .set("background", "var(--lumo-primary-color-10pct, #e3f2fd)")
-                .set("border-left-color", "var(--lumo-primary-color, #1976d2)");
-        card.getElement().executeJs(
-                "this.scrollIntoView({behavior:'smooth', block:'center'})");
-        selectedCard = card;
     }
 
     // ---- Helpers ----

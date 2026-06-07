@@ -1,17 +1,17 @@
 package com.infraleap.sternmap.stern.service;
 
-import com.infraleap.sternmap.stern.domain.VenueOnMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
-
 /**
- * Exercises the live data paths at startup and warms the global venue cache so
- * the first browser request doesn't pay the parallel-pagination cost.
+ * Ops-visibility log emitted once Spring Boot startup is complete. The actual
+ * cache warm + auth now happens in {@link SternVenueCacheService#warmAtStartup}
+ * (a {@code @PostConstruct} that runs BEFORE Tomcat starts accepting
+ * connections) so the first user request never blocks on a cold cache. This
+ * runner just reports the resulting state.
  */
 @Component
 @Order(10)
@@ -29,14 +29,9 @@ public class SternSmokeTest implements CommandLineRunner {
 
     @Override
     public void run(String... args) {
-        boolean authed = authService.login();
-        log.info("Stern auth at startup: {} (token present={})",
-                authed ? "OK" : "FAILED", authService.getToken() != null);
-
-        log.info("Warming venue cache: global Stern IC v2 pagination + global Stern Army per-region REST sweep…");
-        List<VenueOnMap> all = cache.warm();
-        log.info("Cache warm: {} entries total — {} Stern IC, {} Stern Army global, {} cross-flagged",
-                all.size(), cache.getSternIcCount(), cache.getSternArmyCount(),
-                cache.getCrossFlaggedCount());
+        log.info("Stern auth at startup: token present={}", authService.getToken() != null);
+        log.info("Venue cache at startup: {} entries — {} Stern IC, {} Stern Army global, {} cross-flagged",
+                cache.getAllVenues().size(), cache.getSternIcCount(),
+                cache.getSternArmyCount(), cache.getCrossFlaggedCount());
     }
 }
