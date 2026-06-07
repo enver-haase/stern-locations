@@ -255,10 +255,8 @@ public class MapView extends HorizontalLayout {
     }
 
     private void loadVenuesAndRenderMarkers() {
-        long t0 = System.nanoTime();
         statusLine.setText("Loading global Stern IC + global Stern Army (per-region REST sweep)…");
         allVenues = cache.warm();
-        long tWarm = System.nanoTime();
 
         for (VenueOnMap v : allVenues) {
             // Three marker variants:
@@ -274,7 +272,6 @@ public class MapView extends HorizontalLayout {
             map.getFeatureLayer().addFeature(marker);
             markerToVenue.put(marker, v);
         }
-        long tMarkers = System.nanoTime();
 
         // Populate the Grid with every venue, sorted by distance to the user
         // (or alphabetically when we don't yet have a GPS fix). Grid's row
@@ -289,50 +286,30 @@ public class MapView extends HorizontalLayout {
                     .sorted(Comparator.comparing(VenueOnMap::name, String.CASE_INSENSITIVE_ORDER))
                     .toList();
         grid.setItems(ordered);
-        long tDone = System.nanoTime();
 
         statusLine.setText(allVenues.size() + " venues — "
                 + cache.getSternIcCount() + " Stern IC + "
                 + cache.getSternArmyCount() + " Stern Army ("
                 + cache.getCrossFlaggedCount() + " cross-flagged). "
                 + "Click a marker to scroll the list to it.");
-
-        System.out.printf(
-                "[PERF] load: cache.warm() %.1f ms, %d markers %.1f ms, grid.setItems(%d) %.1f ms — total %.1f ms%n",
-                (tWarm - t0) / 1_000_000.0,
-                allVenues.size(), (tMarkers - tWarm) / 1_000_000.0,
-                ordered.size(), (tDone - tMarkers) / 1_000_000.0,
-                (tDone - t0) / 1_000_000.0);
     }
 
     /**
      * Status-line-only reaction to pan/zoom. The Grid contents are fixed once
      * loaded (all venues, sorted by distance), so the extent listener no
-     * longer drives sidebar rendering. We still report "X of N in view" for
-     * the user, and keep the extent value dump in the `[PERF]` line so the
-     * earlier "0 of N in view" bug at certain zoom levels can be diagnosed
-     * from real values. {@link MapExtentFilter} is unit-tested for the
-     * EPSG:4326-degrees contract.
+     * longer drives sidebar rendering — we just report "X of N in view" for
+     * the user. {@link MapExtentFilter} is unit-tested for the EPSG:4326-degrees
+     * contract.
      */
     private void updateInViewStatus(Extent extent) {
         if (extent == null) return;
-        long t0 = System.nanoTime();
         List<VenueOnMap> inView = MapExtentFilter.venuesInExtent(extent, allVenues);
-        long tFilter = System.nanoTime();
         long armyInView = inView.stream().filter(VenueOnMap::isSternArmy).count();
         statusLine.setText(inView.size() + " of " + allVenues.size()
                 + " in view — " + cache.getSternIcCount() + " Stern IC + "
                 + cache.getSternArmyCount() + " Stern Army globally ("
                 + armyInView + " Stern Army in view, " + cache.getCrossFlaggedCount()
                 + " cross-flagged on IC venues).");
-        long tDone = System.nanoTime();
-        System.out.printf(
-                "[PERF] viewMoveEnd: %d/%d in view — extent [lon %.3f..%.3f, lat %.3f..%.3f] zoom %.2f — filter %.1f ms, total %.1f ms%n",
-                inView.size(), allVenues.size(),
-                extent.getMinX(), extent.getMaxX(), extent.getMinY(), extent.getMaxY(),
-                map.getZoom(),
-                (tFilter - t0) / 1_000_000.0,
-                (tDone - t0) / 1_000_000.0);
     }
 
     private Component buildCard(VenueOnMap v) {
